@@ -1,0 +1,226 @@
+#!/usr/bin/perl -X
+###########################################################################
+# \brief Perl script for sending email
+###########################################################################
+
+use strict;
+use Data::Dumper;
+use Getopt::Long;    # GetOptions
+use Net::SMTP::TLS;
+use Sys::Hostname;
+
+$^W = 1;
+my %argv;
+
+my @argv = @ARGV;
+unless (GetOptions(\%argv, qw(debug
+			      bcc=s cc=s from=s
+			      maxsize=s
+			      subject=s
+			      to=s))) {
+
+    print "\n";
+    print "$0 @argv\n";
+    print "\n";
+    print "Usage: $0 mailfile\n";
+    print "  --debug   Enable debug mode\n";
+    print "  --maxsize Truncate long messages to this length (bytes, mb)\n";
+    print "\n";
+    print "Email addresses\n";
+    print "  --bcc     Blind carbon copy list\n";
+    print "  --cc      Carbon copy list\n";
+    print "  --from    Senders email address\n";
+    print "  --subject Subject heading\n";
+    print "  --to      Receipient list\n";
+    print "\n";
+    print "If --to was not specified from/to/cc will be read from\n";
+    print "the first three lines of input from mailfile.\n";
+    die $@;
+}
+$argv{'maxsize'} ||= '0';
+
+my $maxsize = $argv{maxsize};
+if ($maxsize !~ /^\d+$/)
+        {
+	if ($maxsize =~ s/\s*(\d+)\s*mb\s*$/$1/oi)
+	       {
+	       $maxsize = $1 * 1000000;
+	       }
+        }
+
+my $mail_filename = shift || '';
+die "Mail input file $mail_filename does not exist\n"
+    unless ($mail_filename && -e $mail_filename);
+
+my $size = (stat $mail_filename)[7] || 0;
+
+$maxsize = 0 if ($maxsize >= $size);
+
+
+##############################################
+# Set this variable to your smtp server name #
+##############################################
+my $ServerName = "smtp.gmail.com:587";
+
+# Create a new SMTP::TLS object  
+my $smtp = Net::SMTP::TLS->new($ServerName,
+        User    =>      'USER',
+        Password=>      'PASSWORD'); 
+
+# If you can't connect, don't proceed with the rest of the script  
+die "Couldn't connect to server" unless $smtp;
+
+# Initiate the mail transaction 
+# Your "real" email address  
+open(MFH, $mail_filename) or die "Can't open file: $mail_filename\n";
+
+############################################################
+## Grab the first 10 lines and try to extract header fields
+my @MFH;
+foreach my $ct (0..10) {
+    chomp(my $data = <MFH>);
+    push(@MFH, $data);
+}
+
+#######################################
+## Legacy values are always hardcoded
+(my $from_line ||= $MFH[0]) =~ s|^\s*From:\s*||;
+(my $to_line   ||= $MFH[1]) =~ s|^\s*To:\s*||;
+my $cc_line;
+my $subject_line;
+if ($MFH[2]) {
+	($cc_line ||= $MFH[2]) =~ (s|^\s*cc\d*:||) || ( s|^\s*Cc\d*:||)
+	    if ($MFH[2] =~ m|^CC\d*:|oi);
+	($subject_line ||= $MFH[2]) =~ s|^\s*subject:||
+	    if ($MFH[2] =~ m|^Subject:|oi);
+	}
+
+#####################################################################
+## Parse looking for sendmail fields to assign args more accurately
+foreach (@MFH) {
+    if (s|^\s*From:\s*||) {
+	$from_line = $_;
+    } elsif (s|^\s*To:\s*||) {
+        $to_line=$_;
+	my @to_line_tokens = split(/\s*,\s*/,$to_line);
+	$to_line = join(',', @to_line_tokens);
+    } elsif (s|^\s*Subject:\s*||) {
+	$subject_line = $_;
+    } elsif ((s|^\s*CC:\s*||) || (s|^\s*Cc:\s*||))
+    {
+	$cc_line=$_;
+	my @cc_line_tokens = split(/\s*,\s*/,$cc_line);
+	$cc_line = join(',', @cc_line_tokens);
+    }
+}
+
+$cc_line =~ s/"CC:"/""/i;
+$argv{from}    ||= $from_line;
+$argv{to}      ||= $to_line;
+$argv{cc}      ||= $cc_line;
+$argv{subject} ||= $subject_line;
+
+## Deal with uniitialized variables
+foreach (qw(subject from to cc)) {
+    $argv{$_} ||= '';
+}
+
+die "$0.pl an email receipient is required"
+    unless ($argv{to} || $argv{cc});
+
+$argv{from} ||= $ENV{USER};
+$argv{from} .= '@' . &hostname unless ($argv{from} =~ /\@/);
+$smtp->mail( $argv{from} );
+
+my %seen;
+
+## substr(4) == "To|CC: "
+my @to;
+push(@to, split /\s*,\s*/, $argv{to}) if ($argv{to});
+@to = grep(!$seen{$_}++, @to);
+$smtp->to(@to) if (@to);
+
+my @cc;
+push(@cc, split /\s*,\s*/, $argv{cc}) if ($argv{cc});
+@cc = grep(!$seen{$_}++, @cc);
+$smtp->cc(@cc) if (@cc);
+
+my @bcc;
+push(@bcc, split /\s*,\s*/, $argv{bcc}) if ($argv{bcc});
+@bcc = grep(!$seen{$_}++, @bcc);
+$smtp->bcc(@bcc) if (@bcc);
+
+if ($argv{debug})
+{
+	print "Subject: $argv{subject}\n";
+	print "   From: $argv{from}\n";
+	print "     To: @to\n";
+	print "     Cc: @cc\n";
+	print "    Bcc: @bcc\n";
+}
+
+
+# Start the mail  
+$smtp->data(); 
+
+## Subject heading
+$smtp->datasend("Subject: $argv{subject}\n") if ($argv{subject});
+
+## Pass From: some mail clients may need it
+$smtp->datasend("From: $argv{from}\n") if ($argv{from});
+$smtp->datasend("To: $argv{to}\n") if ($argv{to});
+
+## Date
+my $datestring =`date '+%a, %d %b %Y %H:%M:%S %z'`;
+$smtp->datasend("Date: $datestring");
+
+## Message Id
+my $datestring = `date '+%d%m%Y%H%M%S'`;
+chomp $datestring;
+my $random_number = rand();
+$smtp->datasend("Message-ID: <$datestring$random_number\@$ServerName>\n");
+
+
+seek MFH, 0, 0;
+my @mail_message;
+if (!$maxsize)
+        {
+	# No set limit, slurp the file
+	@mail_message = <MFH>;
+        }
+else
+        { # Limit read to the requested size
+	my $bytes = 8192;
+	my $buffer;
+	for(my $offset = 0; $maxsize > $offset; $offset += $bytes)
+	        {
+		if ($offset + $bytes > $maxsize)
+		        {
+		        $bytes = $maxsize - $offset;
+		        }
+		if (0 == read(MFH, $buffer, $bytes, $offset))
+		        {
+		        last;
+		        }
+		push(@mail_message, $buffer);
+		}
+	grep(s|\c0+|\c0|g, @mail_message);
+	}
+close(MHF);
+unlink($mail_filename);
+
+for(my $offset = scalar(@mail_message) > 10 ? 10 : scalar(@mail_message); $offset > -1; $offset--) {
+    $_ = $mail_message[$offset];
+    if (/^\s*(From|Subject|To):/oi) {
+	splice(@mail_message, $offset, 1);
+    }
+}
+
+#Send the email.  
+$smtp->datasend(@mail_message);
+
+# Send the termination string  
+$smtp->dataend(); 
+
+# Close the connection  
+$smtp->quit();
